@@ -1,0 +1,434 @@
+#!/bin/bash
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RAID mount/unmount controller
+# Drives: 2x Seagate IronWolf in Sabrent dock
+# Services: Immich + Nextcloud (docker compose)
+#
+# FIRST TIME SETUP — run this once to populate drive UUIDs:
+#   sudo blkid /dev/sda1 /dev/sdc1
+# Then fill in MEMBER_PART_UUIDS below.
+# ─────────────────────────────────────────────────────────────────────────────
+
+RAID_DEV="/dev/md0"
+MOUNT_POINT="/mnt/raid"
+
+# Per-member device UUIDs — unique per drive, stable across dock re-enumeration.
+# These are NOT the filesystem UUID (all members share that). They are the
+# mdadm device UUIDs, visible in: sudo mdadm --examine /dev/sdX1
+# Format is colon-separated groups, e.g. "3e080a11:7fd36f05:0f3193b5:f2b58570"
+MEMBER_DEV_UUIDS=(
+    "3e080a11:7fd36f05:0f3193b5:f2b58570"
+    "b4f17b10:8641a22a:ac019358:98b42633"
+)
+
+# Docker compose file locations — adjust if needed
+IMMICH_COMPOSE="/opt/immich/docker-compose.yml"
+NEXTCLOUD_COMPOSE="/opt/nextcloud/docker-compose.yml"
+
+# ─── Logging helpers ──────────────────────────────────────────────────────────
+info()  { echo "[*] $*"; }
+ok()    { echo "[+] $*"; }
+warn()  { echo "[!] $*"; }
+die()   { echo "[✗] $*" >&2; exit 1; }
+
+# ─── Resolve partition paths from mdadm Device UUIDs ─────────────────────────
+# Scans all linux_raid_member partitions and matches by per-member Device UUID.
+# Populates MEMBER_PARTS (/dev/sdX1) and MEMBER_DRIVES (/dev/sdX) arrays.
+resolve_drives() {
+    MEMBER_PARTS=()
+    MEMBER_DRIVES=()
+
+    # Find all RAID member partitions visible to the system
+    CANDIDATES=$(blkid -t TYPE="linux_raid_member" -o device 2>/dev/null)
+
+    if [ -z "$CANDIDATES" ]; then
+        warn "No linux_raid_member partitions found. Check dock connection."
+        warn "Falling back to mdadm --scan (less reliable after power loss)."
+        return
+    fi
+
+    for uuid in "${MEMBER_DEV_UUIDS[@]}"; do
+        found=""
+        for part in $CANDIDATES; do
+            DEV_UUID=$(sudo mdadm --examine "$part" 2>/dev/null \
+                | grep "Device UUID" | awk '{print $4}')
+            if [ "$DEV_UUID" = "$uuid" ]; then
+                found="$part"
+                break
+            fi
+        done
+
+        if [ -n "$found" ]; then
+            MEMBER_PARTS+=("$found")
+            MEMBER_DRIVES+=("${found%%[0-9]*}")
+        else
+            warn "Could not find drive with Device UUID $uuid — drive may be missing."
+        fi
+    done
+
+    if [ ${#MEMBER_PARTS[@]} -eq 0 ]; then
+        die "No member drives matched. Check dock connection and run: sudo blkid"
+    fi
+
+    info "Resolved member drives: ${MEMBER_PARTS[*]}"
+}
+
+# ─── Service helpers ───────────────────────────────────────────────────────────
+services_stop() {
+    info "Stopping dependent services..."
+    for compose in "$IMMICH_COMPOSE" "$NEXTCLOUD_COMPOSE"; do
+        if [ -f "$compose" ]; then
+            info "  Stopping $(dirname $compose | xargs basename)..."
+            sudo docker compose -f "$compose" stop 2>/dev/null \
+                && ok "  Stopped: $compose" \
+                || warn "  Could not stop $compose (may already be down)"
+        fi
+    done
+}
+
+services_start() {
+    info "Starting dependent services..."
+    for compose in "$IMMICH_COMPOSE" "$NEXTCLOUD_COMPOSE"; do
+        if [ -f "$compose" ]; then
+            info "  Starting $(dirname $compose | xargs basename)..."
+            sudo docker compose -f "$compose" start 2>/dev/null \
+                && ok "  Started: $compose" \
+                || warn "  Could not start $compose"
+        fi
+    done
+}
+
+# ─── Assemble helper ───────────────────────────────────────────────────────────
+# Tries scan first, then explicit drives. Populates ARRAY_STATE on success.
+assemble_array() {
+    if grep -q "$(basename $RAID_DEV)" /proc/mdstat 2>/dev/null; then
+        info "Array already active in mdstat."
+    else
+        info "Array not active — attempting assembly..."
+        sudo mdadm --assemble --scan 2>/dev/null
+
+        if ! grep -q "$(basename $RAID_DEV)" /proc/mdstat 2>/dev/null; then
+            if [ ${#MEMBER_PARTS[@]} -ge 2 ]; then
+                info "Scan failed — assembling with explicit drives: ${MEMBER_PARTS[*]}"
+                sudo mdadm --assemble "$RAID_DEV" "${MEMBER_PARTS[@]}" 2>/dev/null
+            fi
+        fi
+
+        if ! grep -q "$(basename $RAID_DEV)" /proc/mdstat 2>/dev/null; then
+            warn "Standard assembly failed — try: $0 recover"
+            return 1
+        fi
+    fi
+
+    ARRAY_STATE=$(sudo mdadm --detail "$RAID_DEV" 2>/dev/null \
+        | grep "State :" | awk '{$1=$2=""; print $0}' | xargs)
+    info "Array state: $ARRAY_STATE"
+    return 0
+}
+
+# ─── fsck helper ───────────────────────────────────────────────────────────────
+# Read-only check first. On errors, tries backup superblocks then repair.
+run_fsck() {
+    info "Running filesystem check..."
+    sudo fsck -n "$RAID_DEV" 2>&1 | tail -5
+    FSCK_EXIT=${PIPESTATUS[0]}
+
+    if [ $FSCK_EXIT -eq 0 ] || [ $FSCK_EXIT -eq 1 ]; then
+        ok "Filesystem clean."
+        return 0
+    fi
+
+    # Exit code 8 = can't open device / corrupt superblock — try backup superblocks
+    if [ $FSCK_EXIT -eq 8 ]; then
+        warn "Cannot read primary superblock (exit $FSCK_EXIT) — trying backup superblocks..."
+        BACKUP_BLOCKS=$(sudo mke2fs -n "$RAID_DEV" 2>/dev/null \
+            | grep -oP "(?<=Superblock backups stored on blocks: ).*" \
+            | tr ',' '\n' | tr -d ' ' | head -5)
+
+        if [ -z "$BACKUP_BLOCKS" ]; then
+            die "Could not determine backup superblock locations. Manual intervention required."
+        fi
+
+        FIXED=0
+        for sb in $BACKUP_BLOCKS; do
+            info "Trying backup superblock at block $sb..."
+            if sudo e2fsck -b "$sb" -y "$RAID_DEV"; then
+                ok "Filesystem repaired using backup superblock at block $sb."
+                FIXED=1
+                break
+            fi
+        done
+        [ $FIXED -eq 0 ] && die "All backup superblocks failed. Run: sudo dmesg | tail -30"
+        return 0
+    fi
+
+    # Exit codes 2-7 = errors found, attempt repair
+    if [ $FSCK_EXIT -ge 2 ]; then
+        warn "Filesystem errors found (exit code $FSCK_EXIT) — running repair pass..."
+        sudo e2fsck -f -y "$RAID_DEV" \
+            || die "fsck repair failed. Manual intervention required."
+        ok "Filesystem repaired."
+    fi
+}
+
+# ─── MOUNT ─────────────────────────────────────────────────────────────────────
+mount_raid() {
+    if mountpoint -q "$MOUNT_POINT"; then
+        warn "RAID already mounted at $MOUNT_POINT."
+        return
+    fi
+
+    resolve_drives
+    services_stop
+    assemble_array || die "Array assembly failed. Try: $0 recover"
+
+    if echo "$ARRAY_STATE" | grep -qi "degraded"; then
+        warn "Array is DEGRADED — one drive may be missing or failed."
+        warn "Check: sudo mdadm --detail $RAID_DEV"
+        warn "Mounting anyway — verify data and replace failed drive ASAP."
+    fi
+
+    run_fsck
+
+    [ ! -d "$MOUNT_POINT" ] && sudo mkdir -p "$MOUNT_POINT"
+
+    info "Mounting $RAID_DEV → $MOUNT_POINT..."
+    sudo mount "$RAID_DEV" "$MOUNT_POINT" \
+        || die "Mount failed. Check: dmesg | tail -20"
+
+    mountpoint -q "$MOUNT_POINT" \
+        || die "Mount command returned success but mountpoint check failed."
+
+    ok "RAID mounted at $MOUNT_POINT"
+    services_start
+    ok "Done."
+}
+
+# ─── UNMOUNT ───────────────────────────────────────────────────────────────────
+unmount_raid() {
+    if ! mountpoint -q "$MOUNT_POINT"; then
+        warn "RAID is not currently mounted."
+        return
+    fi
+
+    # Resolve drives while array is still mounted — blkid sees members reliably here
+    resolve_drives
+    # Fall back to reading current members directly from mdadm if resolve failed
+    if [ ${#MEMBER_DRIVES[@]} -eq 0 ]; then
+        warn "UUID resolve failed — reading current members from mdadm..."
+        MEMBER_PARTS=($(sudo mdadm --detail "$RAID_DEV" 2>/dev/null \
+            | grep "active sync" | awk '{print $NF}'))
+        MEMBER_DRIVES=($(for p in "${MEMBER_PARTS[@]}"; do echo "${p%%[0-9]*}"; done))
+        info "Fallback resolved: ${MEMBER_DRIVES[*]}"
+    fi
+
+    services_stop
+
+    info "Releasing any processes using $MOUNT_POINT..."
+    sudo fuser -km "$MOUNT_POINT" 2>/dev/null
+    sleep 2
+
+    info "Unmounting $MOUNT_POINT..."
+    sudo umount "$MOUNT_POINT" \
+        || die "Unmount failed. Check: sudo fuser -v $MOUNT_POINT"
+
+    # Give the kernel time to fully release the device before stopping the array
+    sleep 3
+
+    info "Stopping RAID array $RAID_DEV..."
+    sudo mdadm --stop "$RAID_DEV" 2>/dev/null
+    if grep -q "$(basename $RAID_DEV)" /proc/mdstat 2>/dev/null; then
+        sleep 3
+        sudo mdadm --stop "$RAID_DEV" \
+            || warn "Could not stop array — may require reboot to fully release."
+    else
+        ok "Array stopped."
+    fi
+
+    for drive in "${MEMBER_DRIVES[@]}"; do
+        info "Spinning down $drive..."
+        sudo hdparm -Y "$drive" 2>/dev/null \
+            || warn "Could not spin down $drive (hdparm may not be installed)"
+    done
+
+    ok "RAID unmounted and drives spun down safely."
+}
+
+# ─── RECOVER ───────────────────────────────────────────────────────────────────
+# Full recovery after power loss or dock re-enumeration:
+#   1. Examine drives and report event counts
+#   2. Stop any broken/partial array state
+#   3. Reassemble explicitly with all found drives
+#   4. Run fsck
+#   5. Mount and restart services
+#   6. Update mdadm.conf
+recover_raid() {
+    warn "Starting recovery sequence..."
+    warn "This is safe to run after power loss or dock reconnection."
+    echo ""
+
+    resolve_drives
+
+    if [ ${#MEMBER_PARTS[@]} -lt 2 ]; then
+        warn "Only ${#MEMBER_PARTS[@]} drive(s) found — expected 2."
+        warn "Check dock connection. Detected: ${MEMBER_PARTS[*]:-none}"
+        if [ ${#MEMBER_PARTS[@]} -eq 1 ]; then
+            warn ""
+            warn "One drive is missing. You can still mount in degraded mode to recover data:"
+            warn "  sudo mdadm --assemble --run $RAID_DEV ${MEMBER_PARTS[*]}"
+            warn "  sudo mount $RAID_DEV $MOUNT_POINT"
+            warn "Back up your data before the remaining drive fails too."
+        fi
+        die "Aborting recovery — insufficient drives."
+    fi
+
+    # Examine drives and report — helps diagnose which is more up-to-date
+    info "Examining member drives..."
+    for part in "${MEMBER_PARTS[@]}"; do
+        EVENTS=$(sudo mdadm --examine "$part" 2>/dev/null | grep "Events" | awk '{print $3}')
+        STATE=$(sudo mdadm --examine "$part" 2>/dev/null | grep "Array State" | awk '{print $4}')
+        info "  $part — Events: ${EVENTS:-unknown}, Array State: ${STATE:-unknown}"
+    done
+    echo ""
+
+    # Stop any broken/partial array before clean reassembly
+    if grep -q "$(basename $RAID_DEV)" /proc/mdstat 2>/dev/null; then
+        info "Stopping existing broken array state..."
+        sudo mdadm --stop "$RAID_DEV" 2>/dev/null \
+            && info "Array stopped." \
+            || warn "Could not stop array."
+        sleep 1
+    fi
+
+    # Reassemble with both drives named explicitly
+    info "Reassembling array with: ${MEMBER_PARTS[*]}"
+    sudo mdadm --assemble "$RAID_DEV" "${MEMBER_PARTS[@]}" \
+        || sudo mdadm --assemble --run "$RAID_DEV" "${MEMBER_PARTS[@]}" \
+        || die "Assembly failed. Check: sudo mdadm --examine ${MEMBER_PARTS[*]}"
+
+    ACTIVE=$(sudo mdadm --detail "$RAID_DEV" 2>/dev/null \
+        | grep "Active Devices" | awk '{print $4}')
+    ARRAY_STATE=$(sudo mdadm --detail "$RAID_DEV" 2>/dev/null \
+        | grep "State :" | awk '{$1=$2=""; print $0}' | xargs)
+    ok "Array assembled — State: $ARRAY_STATE, Active drives: $ACTIVE/2"
+
+    if [ "${ACTIVE:-0}" -lt 2 ] 2>/dev/null; then
+        warn "Array has only $ACTIVE active drive(s) — running degraded."
+        warn "Check SMART health: sudo smartctl -H ${MEMBER_DRIVES[*]}"
+    fi
+
+    echo ""
+    run_fsck
+
+    echo ""
+    [ ! -d "$MOUNT_POINT" ] && sudo mkdir -p "$MOUNT_POINT"
+
+    info "Mounting $RAID_DEV → $MOUNT_POINT..."
+    sudo mount "$RAID_DEV" "$MOUNT_POINT" \
+        || die "Mount failed after recovery. Check: dmesg | tail -20"
+
+    mountpoint -q "$MOUNT_POINT" \
+        || die "Mount command returned success but mountpoint check failed."
+
+    ok "RAID mounted at $MOUNT_POINT"
+    echo ""
+
+    # Lock in current config so boot reassembly works next time
+    info "Updating mdadm.conf..."
+    sudo mdadm --detail --scan | sudo tee /etc/mdadm/mdadm.conf > /dev/null \
+        && ok "mdadm.conf updated." \
+        || warn "Could not update mdadm.conf — run: sudo mdadm --detail --scan | sudo tee /etc/mdadm/mdadm.conf"
+
+    info "Updating initramfs..."
+    sudo update-initramfs -u 2>/dev/null \
+        && ok "initramfs updated." \
+        || warn "Could not update initramfs — run: sudo update-initramfs -u"
+
+    echo ""
+    services_start
+    echo ""
+    ok "Recovery complete."
+    echo ""
+    df -h "$MOUNT_POINT"
+}
+
+# ─── STATUS ────────────────────────────────────────────────────────────────────
+status_raid() {
+    resolve_drives 2>/dev/null
+
+    echo "═══ Mount status ════════════════════════════"
+    if mountpoint -q "$MOUNT_POINT"; then
+        ok "Mounted at $MOUNT_POINT"
+        df -h "$MOUNT_POINT"
+    else
+        warn "Not mounted"
+    fi
+
+    echo ""
+    echo "═══ Array state ═════════════════════════════"
+    if grep -q "$(basename $RAID_DEV)" /proc/mdstat 2>/dev/null; then
+        sudo mdadm --detail "$RAID_DEV" 2>/dev/null \
+            | grep -E "State :|Active Devices|Working Devices|Failed Devices|UUID"
+        echo ""
+        sudo mdadm --detail "$RAID_DEV" 2>/dev/null \
+            | grep -E "active sync|spare|faulty|removed"
+    else
+        warn "Array not active — drive letters may have changed after dock reconnect."
+        echo ""
+        echo "  Visible block devices:"
+        lsblk -o NAME,SIZE,TYPE | grep -v "loop\|nvme\|disk$" | grep "part"
+        echo ""
+        echo "  Run: $0 recover"
+    fi
+
+    echo ""
+    echo "═══ Drive health ════════════════════════════"
+    if [ ${#MEMBER_DRIVES[@]} -eq 0 ]; then
+        warn "No drives resolved — UUIDs not configured or drives not present."
+        warn "Run: sudo blkid  to see available drives"
+    else
+        for i in "${!MEMBER_DRIVES[@]}"; do
+            drive="${MEMBER_DRIVES[$i]}"
+            part="${MEMBER_PARTS[$i]}"
+            echo "  $drive  (partition $part)"
+            SMART=$(sudo smartctl -H "$drive" 2>/dev/null | grep "overall-health")
+            if [ -n "$SMART" ]; then
+                echo "    $SMART"
+                CONCERNS=$(sudo smartctl -a "$drive" 2>/dev/null \
+                    | grep -E "Reallocated_Sector|Pending_Sector|Uncorrectable" \
+                    | awk '$10 != 0 {print "    [!] "$2": "$10" raw count"}')
+                [ -n "$CONCERNS" ] && echo "$CONCERNS" || echo "    No concerning SMART attributes."
+            else
+                warn "    smartctl unavailable for $drive"
+            fi
+            echo ""
+        done
+    fi
+
+    echo "═══ Recent RAID events (dmesg) ══════════════"
+    sudo dmesg | grep -iE "md/raid|md0|sda|sdb|sdc" | tail -5 || echo "  (none)"
+}
+
+# ─── Entry point ───────────────────────────────────────────────────────────────
+case "$1" in
+    mount)   mount_raid   ;;
+    unmount) unmount_raid ;;
+    recover) recover_raid ;;
+    status)  status_raid  ;;
+    *)
+        echo "Usage: $0 {mount|unmount|recover|status}"
+        echo ""
+        echo "  mount    — assemble, fsck-check, and mount the RAID"
+        echo "             stops Immich + Nextcloud before, restarts after"
+        echo "  unmount  — stop services, unmount, stop array, spin down drives"
+        echo "  recover  — full recovery after power loss or dock re-enumeration:"
+        echo "             stops broken array → reassembles with explicit drives"
+        echo "             → fsck (with backup superblock fallback) → mount"
+        echo "             → updates mdadm.conf and initramfs"
+        echo "  status   — mount state, array health, SMART status, recent dmesg"
+        echo ""
+        echo "  After any power loss, always run: $0 recover"
+        exit 1
+        ;;
+esac
