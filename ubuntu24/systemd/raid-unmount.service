@@ -1,0 +1,16 @@
+[Unit]
+Description=RAID safe unmount on shutdown
+DefaultDependencies=no
+Before=shutdown.target reboot.target halt.target
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/sbin/raid-control unmount
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

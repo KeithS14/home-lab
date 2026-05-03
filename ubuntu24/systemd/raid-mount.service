@@ -1,0 +1,20 @@
+[Unit]
+Description=RAID recovery and mount on boot
+# Wait for block devices and mdadm to be ready
+After=local-fs.target mdadm.service systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+# Docker must not start until we are done
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Full recover sequence: reassemble → fsck → mount
+ExecStart=/usr/local/sbin/raid-control recover
+# If mount fails, do not bring down the whole boot — just skip Docker
+# Remove the next line if you want a hard failure instead
+ExecStartPost=/bin/bash -c 'mountpoint -q /mnt/raid || echo "[!] RAID not mounted — Docker will not start"'
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
